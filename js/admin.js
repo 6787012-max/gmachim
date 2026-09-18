@@ -55,11 +55,16 @@
       api('gmach_suggestions?select=*&order=created_at.desc&limit=200'),
       api('gmachim?select=*&order=code'),
       api('gmach_categories?select=*&order=sort'),
-      api('gmach_searches?select=q,results,created_at&order=created_at.desc&limit=200')
+      api('gmach_searches?select=q,results,created_at&order=created_at.desc&limit=200'),
+      api('gmach_items_stock?select=*&order=name'),
+      api('gmach_loans_view?select=*&order=is_overdue.desc,due_date.asc,date_out.desc')
     ]).then(function (r) {
       DATA.sugg = r[0]; DATA.gm = r[1]; DATA.cats = r[2]; DATA.se = r[3];
+      DATA.items = r[4] || []; DATA.loans = r[5] || [];
       var open = DATA.sugg.filter(function (s) { return s.status === 'new'; });
+      var openLoans = DATA.loans.filter(function (l) { return !l.returned_at; });
       $('bSugg').textContent = open.length;
+      var bl = $('bLoans'); if (bl) bl.textContent = openLoans.length;
       stats(); draw();
     }).catch(function (e) {
       $('pane').innerHTML = '<div class="empty"><b>שגיאת טעינה</b>' + esc(e.message) + '</div>';
@@ -84,8 +89,303 @@
   function draw() {
     if (T === 'sugg') return paneSugg();
     if (T === 'list') return paneList();
+    if (T === 'loans') return paneLoans();
+    if (T === 'items') return paneItems();
     if (T === 'search') return paneSearch();
     if (T === 'export') return paneExport();
+  }
+
+  /* ---------- השאלות ---------- */
+  function fmtDate(d) {
+    if (!d) return '—';
+    try { return new Date(d).toLocaleDateString('he-IL'); } catch (e) { return d; }
+  }
+  function daysDiff(a, b) {
+    if (!a || !b) return null;
+    return Math.round((new Date(a) - new Date(b)) / 86400000);
+  }
+
+  function paneLoans() {
+    var open = DATA.loans.filter(function (l) { return !l.returned_at; });
+    var overdue = open.filter(function (l) { return l.is_overdue; });
+    var soon = open.filter(function (l) {
+      if (l.is_overdue || !l.due_date) return false;
+      var d = daysDiff(l.due_date, new Date().toISOString().slice(0, 10));
+      return d !== null && d >= 0 && d <= 2;
+    });
+    var closed = DATA.loans.filter(function (l) { return l.returned_at; }).slice(0, 30);
+
+    var addBtn = '<button class="btn pri" id="loanNew" style="margin-bottom:14px">+ השאלה חדשה</button>';
+    var summary = '<div class="stat">' +
+      box(open.length, 'פתוחות') +
+      box(overdue.length, 'באיחור') +
+      box(soon.length, 'להחזרה השבוע') +
+      '</div>';
+
+    var makeRow = function (l) {
+      var dueTxt = l.due_date ? fmtDate(l.due_date) : '—';
+      var color = '';
+      if (!l.returned_at && l.is_overdue) color = 'background:#FFE5E5';
+      else if (!l.returned_at && soon.indexOf(l) >= 0) color = 'background:#FFF6E8';
+      return '<tr style="' + color + '">' +
+        '<td>' + esc(l.item_name || '—') +
+          (l.gmach_name ? '<div style="font-size:12px;color:var(--muted)">' + esc(l.gmach_name) + '</div>' : '') +
+        '</td>' +
+        '<td>' + l.qty + '</td>' +
+        '<td>' + esc(l.borrower_name || '') +
+          (l.borrower_phone ? '<div style="font-size:12px;color:var(--muted)">' + esc(l.borrower_phone) + '</div>' : '') +
+        '</td>' +
+        '<td>' + fmtDate(l.date_out) + '</td>' +
+        '<td>' + dueTxt + '</td>' +
+        '<td>' + (l.returned_at ? fmtDate(l.returned_at) : '<b style="color:#B4400A">פתוח</b>') + '</td>' +
+        '<td>' + (l.paid ? '✔' : (l.amount ? '<span style="color:#B4400A">₪' + l.amount + '</span>' : '—')) + '</td>' +
+        '<td>' +
+          (l.returned_at
+            ? '<button class="btn sm js-loan-reopen" data-id="' + l.id + '">בטל החזרה</button>'
+            : '<button class="btn sm pri js-loan-return" data-id="' + l.id + '">סמן כמוחזר</button> ' +
+              '<button class="btn sm js-loan-edit" data-id="' + l.id + '">ערוך</button>') +
+        '</td>' +
+      '</tr>';
+    };
+
+    var openHTML = open.length
+      ? '<div class="wrap"><table class="tbl"><thead><tr>' +
+        '<th>פריט</th><th>כמות</th><th>שואל</th><th>יציאה</th><th>החזרה מתוכננת</th>' +
+        '<th>הוחזר בפועל</th><th>שולם</th><th></th></tr></thead><tbody>' +
+        open.map(makeRow).join('') + '</tbody></table></div>'
+      : '<div class="empty"><b>אין השאלות פתוחות</b>הכל בבית.</div>';
+
+    var closedHTML = closed.length
+      ? '<h3 style="margin:24px 0 8px">30 השאלות אחרונות שהוחזרו</h3>' +
+        '<div class="wrap"><table class="tbl"><thead><tr>' +
+        '<th>פריט</th><th>כמות</th><th>שואל</th><th>יציאה</th><th>החזרה מתוכננת</th>' +
+        '<th>הוחזר בפועל</th><th>שולם</th><th></th></tr></thead><tbody>' +
+        closed.map(makeRow).join('') + '</tbody></table></div>'
+      : '';
+
+    $('pane').innerHTML = addBtn + summary +
+      '<h3 style="margin:16px 0 8px">השאלות פתוחות</h3>' + openHTML + closedHTML;
+
+    $('loanNew').onclick = function () { openLoanForm(null); };
+  }
+
+  function openLoanForm(existingId) {
+    var l = existingId
+      ? DATA.loans.filter(function (x) { return x.id === +existingId; })[0]
+      : null;
+    if (existingId && !l) return;
+
+    if (!DATA.items.length) {
+      alert('אין עדיין פריטים במלאי — קודם צריך להוסיף פריט בטאב "מלאי".');
+      return;
+    }
+    var itemOpts = DATA.items.map(function (it) {
+      var g = DATA.gm.filter(function (x) { return x.id === it.gmach_id; })[0];
+      var lbl = it.name + (g ? ' · ' + g.name : '') +
+                ' (זמין ' + it.avail_qty + '/' + it.total_qty + ')';
+      return '<option value="' + it.id + '"' +
+        (l && l.item_id === it.id ? ' selected' : '') + '>' + esc(lbl) + '</option>';
+    }).join('');
+
+    var today = new Date().toISOString().slice(0, 10);
+    var dueDefault = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
+
+    var html = '<div id="loanOv" class="ov on" style="position:fixed;inset:0;' +
+      'background:rgba(0,0,0,.5);z-index:1000;display:flex;align-items:center;' +
+      'justify-content:center;padding:14px;overflow:auto">' +
+      '<div style="background:#fff;border-radius:14px;max-width:520px;width:100%;' +
+      'padding:22px;max-height:92vh;overflow:auto">' +
+      '<h3 style="margin:0 0 12px">' + (l ? 'עריכת השאלה' : 'השאלה חדשה') + '</h3>' +
+      '<div class="f"><label>פריט</label><select data-k="item_id">' + itemOpts + '</select></div>' +
+      '<div class="f"><label>כמות</label>' +
+        '<input data-k="qty" type="number" min="1" value="' + (l ? l.qty : 1) + '"></div>' +
+      '<div class="f"><label>שם השואל</label>' +
+        '<input data-k="borrower_name" type="text" value="' + esc(l ? l.borrower_name : '') + '"></div>' +
+      '<div class="f"><label>טלפון</label>' +
+        '<input data-k="borrower_phone" type="tel" value="' + esc(l ? l.borrower_phone : '') + '"></div>' +
+      '<div class="f"><label>תאריך יציאה</label>' +
+        '<input data-k="date_out" type="date" value="' + (l ? l.date_out : today) + '"></div>' +
+      '<div class="f"><label>תאריך החזרה מתוכנן</label>' +
+        '<input data-k="due_date" type="date" value="' + (l && l.due_date ? l.due_date : dueDefault) + '"></div>' +
+      '<div class="f"><label>עלות (אופציונלי)</label>' +
+        '<input data-k="amount" type="number" step="0.5" value="' + (l && l.amount != null ? l.amount : '') + '"></div>' +
+      '<div class="f"><label style="display:flex;align-items:center;gap:8px">' +
+        '<input data-k="paid" type="checkbox"' + (l && l.paid ? ' checked' : '') + '> שולם</label></div>' +
+      '<div class="f"><label>הערות</label>' +
+        '<textarea data-k="notes" rows="2">' + esc(l ? l.notes : '') + '</textarea></div>' +
+      '<div class="acts" style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">' +
+      '<button class="btn pri" id="loanSave">' + (l ? 'עדכן' : 'שמור השאלה') + '</button>' +
+      (l ? '<button class="btn ghost" id="loanDel" style="color:#B4400A;border-color:#B4400A">מחק</button>' : '') +
+      '<button class="btn ghost" id="loanCancel">ביטול</button>' +
+      '</div><div class="msg" id="loanMsg"></div></div></div>';
+
+    var wrap = document.createElement('div');
+    wrap.innerHTML = html;
+    document.body.appendChild(wrap.firstChild);
+    var close = function () { var o = $('loanOv'); if (o) o.parentNode.removeChild(o); };
+    $('loanCancel').onclick = close;
+    if ($('loanDel')) $('loanDel').onclick = function () {
+      if (!confirm('למחוק את ההשאלה?')) return;
+      api('gmach_loans?id=eq.' + l.id, { method: 'DELETE' })
+        .then(function () { close(); load(); })
+        .catch(function (e) {
+          $('loanMsg').textContent = 'שגיאה: ' + e.message;
+          $('loanMsg').className = 'msg err';
+        });
+    };
+    $('loanSave').onclick = function () {
+      var body = {};
+      [].forEach.call(document.querySelectorAll('#loanOv [data-k]'), function (el) {
+        var k = el.dataset.k;
+        if (el.type === 'checkbox') body[k] = el.checked;
+        else if (el.type === 'number') body[k] = el.value === '' ? null : Number(el.value);
+        else if (el.type === 'date') body[k] = el.value || null;
+        else body[k] = el.value.trim();
+      });
+      if (!body.borrower_name) {
+        $('loanMsg').textContent = 'חסר שם שואל';
+        $('loanMsg').className = 'msg err'; return;
+      }
+      if (!body.qty || body.qty < 1) body.qty = 1;
+      $('loanSave').disabled = true;
+      var call = l
+        ? api('gmach_loans?id=eq.' + l.id, { method: 'PATCH', body: JSON.stringify(body) })
+        : api('gmach_loans', { method: 'POST', body: JSON.stringify(body) });
+      call.then(function (r) {
+        if (!r || (Array.isArray(r) && !r.length)) throw new Error('לא נשמרה שורה');
+        close(); load();
+      }).catch(function (e) {
+        $('loanMsg').textContent = 'שגיאה: ' + e.message;
+        $('loanMsg').className = 'msg err';
+        $('loanSave').disabled = false;
+      });
+    };
+  }
+
+  function returnLoan(id) {
+    var today = new Date().toISOString().slice(0, 10);
+    api('gmach_loans?id=eq.' + id, {
+      method: 'PATCH',
+      body: JSON.stringify({ returned_at: today, paid: true })
+    }).then(function (r) {
+      if (!r || !r.length) throw new Error('לא עודכנה שורה');
+      load();
+    }).catch(function (e) { alert('שגיאה: ' + e.message); });
+  }
+  function reopenLoan(id) {
+    api('gmach_loans?id=eq.' + id, {
+      method: 'PATCH', body: JSON.stringify({ returned_at: null })
+    }).then(function (r) {
+      if (!r || !r.length) throw new Error('לא עודכנה שורה');
+      load();
+    }).catch(function (e) { alert('שגיאה: ' + e.message); });
+  }
+
+  /* ---------- מלאי ---------- */
+  function paneItems() {
+    var addBtn = '<button class="btn pri" id="itemNew" style="margin-bottom:14px">+ פריט חדש</button>';
+    var rows = DATA.items.map(function (it) {
+      var g = DATA.gm.filter(function (x) { return x.id === it.gmach_id; })[0];
+      var short = it.avail_qty <= 0;
+      return '<tr' + (short ? ' style="background:#FFE5E5"' : '') + '>' +
+        '<td>' + esc(it.name) + '</td>' +
+        '<td>' + esc(g ? g.name : '—') + '</td>' +
+        '<td>' + it.total_qty + '</td>' +
+        '<td>' + it.out_qty + '</td>' +
+        '<td><b>' + it.avail_qty + '</b></td>' +
+        '<td>' + esc(it.unit || '') + '</td>' +
+        '<td>' + esc(it.location || '') + '</td>' +
+        '<td>' +
+          '<button class="btn sm js-item-edit" data-id="' + it.id + '">ערוך</button> ' +
+          '<button class="btn sm js-item-del" data-id="' + it.id + '" style="color:#B4400A">מחק</button>' +
+        '</td></tr>';
+    }).join('');
+
+    var table = DATA.items.length
+      ? '<div class="wrap"><table class="tbl"><thead><tr>' +
+        '<th>פריט</th><th>גמ"ח</th><th>סה"כ</th><th>בחוץ</th><th>זמין</th>' +
+        '<th>יחידה</th><th>מיקום</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+      : '<div class="empty"><b>אין עדיין פריטים במלאי</b>' +
+        'לחץ "פריט חדש" כדי להתחיל.</div>';
+
+    $('pane').innerHTML = addBtn + table;
+    $('itemNew').onclick = function () { openItemForm(null); };
+  }
+
+  function openItemForm(existingId) {
+    var it = existingId ? DATA.items.filter(function (x) { return x.id === +existingId; })[0] : null;
+    if (existingId && !it) return;
+
+    var gmachOpts = '<option value="">— בחר גמ"ח —</option>' + DATA.gm
+      .filter(function (g) { return g.status === 'approved' && !g.is_wanted; })
+      .map(function (g) {
+        return '<option value="' + g.id + '"' +
+          (it && it.gmach_id === g.id ? ' selected' : '') + '>' +
+          esc('קוד ' + g.code + ' · ' + g.name) + '</option>';
+      }).join('');
+
+    var html = '<div id="itemOv" class="ov on" style="position:fixed;inset:0;' +
+      'background:rgba(0,0,0,.5);z-index:1000;display:flex;align-items:center;' +
+      'justify-content:center;padding:14px;overflow:auto">' +
+      '<div style="background:#fff;border-radius:14px;max-width:520px;width:100%;' +
+      'padding:22px;max-height:92vh;overflow:auto">' +
+      '<h3 style="margin:0 0 12px">' + (it ? 'עריכת פריט' : 'פריט חדש') + '</h3>' +
+      '<div class="f"><label>גמ"ח שייך</label>' +
+        '<select data-k="gmach_id">' + gmachOpts + '</select></div>' +
+      '<div class="f"><label>שם הפריט</label>' +
+        '<input data-k="name" type="text" value="' + esc(it ? it.name : '') + '"></div>' +
+      '<div class="f"><label>כמות כוללת</label>' +
+        '<input data-k="total_qty" type="number" min="1" value="' + (it ? it.total_qty : 1) + '"></div>' +
+      '<div class="f"><label>יחידה</label>' +
+        '<input data-k="unit" type="text" value="' + esc(it ? it.unit : 'יחידה') + '" placeholder="יחידה / זוג / סט"></div>' +
+      '<div class="f"><label>מיקום</label>' +
+        '<input data-k="location" type="text" value="' + esc(it ? it.location : '') + '" placeholder="מחסן / בית ...">' + '</div>' +
+      '<div class="f"><label>הערות</label>' +
+        '<textarea data-k="notes" rows="2">' + esc(it ? it.notes : '') + '</textarea></div>' +
+      '<div class="acts" style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">' +
+      '<button class="btn pri" id="itSave">' + (it ? 'עדכן' : 'שמור') + '</button>' +
+      '<button class="btn ghost" id="itCancel">ביטול</button>' +
+      '</div><div class="msg" id="itMsg"></div></div></div>';
+
+    var wrap = document.createElement('div');
+    wrap.innerHTML = html;
+    document.body.appendChild(wrap.firstChild);
+    var close = function () { var o = $('itemOv'); if (o) o.parentNode.removeChild(o); };
+    $('itCancel').onclick = close;
+    $('itSave').onclick = function () {
+      var body = {};
+      [].forEach.call(document.querySelectorAll('#itemOv [data-k]'), function (el) {
+        var k = el.dataset.k;
+        if (el.type === 'number') body[k] = el.value === '' ? null : Number(el.value);
+        else body[k] = el.value.trim() || null;
+      });
+      if (!body.name) {
+        $('itMsg').textContent = 'חסר שם פריט';
+        $('itMsg').className = 'msg err'; return;
+      }
+      if (!body.total_qty || body.total_qty < 1) body.total_qty = 1;
+      $('itSave').disabled = true;
+      var call = it
+        ? api('gmach_items?id=eq.' + it.id, { method: 'PATCH', body: JSON.stringify(body) })
+        : api('gmach_items', { method: 'POST', body: JSON.stringify(body) });
+      call.then(function (r) {
+        if (!r || (Array.isArray(r) && !r.length)) throw new Error('לא נשמרה שורה');
+        close(); load();
+      }).catch(function (e) {
+        $('itMsg').textContent = 'שגיאה: ' + e.message;
+        $('itMsg').className = 'msg err';
+        $('itSave').disabled = false;
+      });
+    };
+  }
+  function delItem(id) {
+    var it = DATA.items.filter(function (x) { return x.id === +id; })[0];
+    if (!it) return;
+    if (it.out_qty > 0) { alert('לא ניתן למחוק פריט שיש עליו השאלות פתוחות.'); return; }
+    if (!confirm('למחוק את הפריט "' + it.name + '"?')) return;
+    api('gmach_items?id=eq.' + id, { method: 'DELETE' })
+      .then(load)
+      .catch(function (e) { alert('שגיאה: ' + e.message); });
   }
 
   function paneSugg() {
@@ -323,10 +623,17 @@
   document.addEventListener('click', function (e) {
     var edit = e.target.closest && e.target.closest('.js-edit');
     if (edit) { openEdit(edit.dataset.id); return; }
+    var loanE = e.target.closest && e.target.closest('.js-loan-edit');
+    if (loanE) { openLoanForm(loanE.dataset.id); return; }
+    var itE = e.target.closest && e.target.closest('.js-item-edit');
+    if (itE) { openItemForm(itE.dataset.id); return; }
     var t = e.target;
     if (t.classList.contains('js-ok')) return approve(t.dataset.id);
     if (t.classList.contains('js-done')) return mark(t.dataset.id, 'done', 'טופל ידנית').then(load);
     if (t.classList.contains('js-rej')) return mark(t.dataset.id, 'rejected', '').then(load);
+    if (t.classList.contains('js-loan-return')) return returnLoan(t.dataset.id);
+    if (t.classList.contains('js-loan-reopen')) return reopenLoan(t.dataset.id);
+    if (t.classList.contains('js-item-del')) return delItem(t.dataset.id);
     if (t.classList.contains('js-hide')) {
       return api('gmachim?id=eq.' + t.dataset.id, {
         method: 'PATCH', body: JSON.stringify({ status: t.dataset.s })
