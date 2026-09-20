@@ -18,10 +18,58 @@
       Prefer: 'return=representation'
     };
   }
-  function api(p, o) {
+  function isExpired(t) {
+    return /JWT expired|PGRST303|invalid JWT|token is expired/i.test(t || '');
+  }
+  function saveToks(d) {
+    TOK = d.access_token;
+    try {
+      sessionStorage.setItem('gm_tok', TOK);
+      if (d.refresh_token) sessionStorage.setItem('gm_ref', d.refresh_token);
+    } catch (x) {}
+  }
+  function clearToks() {
+    TOK = null;
+    try {
+      sessionStorage.removeItem('gm_tok');
+      sessionStorage.removeItem('gm_ref');
+    } catch (e) {}
+  }
+  var _refP = null;
+  function refresh() {
+    if (_refP) return _refP;
+    var rt = null;
+    try { rt = sessionStorage.getItem('gm_ref'); } catch (e) {}
+    if (!rt) return Promise.reject(new Error('no_refresh'));
+    _refP = fetch(CFG.url + '/auth/v1/token?grant_type=refresh_token', {
+      method: 'POST',
+      headers: { apikey: CFG.anon, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: rt })
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (!d.access_token) throw new Error('refresh_failed');
+      saveToks(d);
+    }).finally(function () { _refP = null; });
+    return _refP;
+  }
+  function toLogin() {
+    clearToks();
+    var a = $('app'), l = $('login'), o = $('out');
+    if (a) a.hidden = true;
+    if (l) l.hidden = false;
+    if (o) o.hidden = true;
+    var m = $('lMsg');
+    if (m) { m.textContent = 'פג תוקף החיבור, יש להיכנס מחדש.'; m.className = 'msg err'; }
+  }
+  function api(p, o, _retried) {
     o = o || {}; o.headers = H();
     return fetch(CFG.url + '/rest/v1/' + p, o).then(function (r) {
-      if (!r.ok) return r.text().then(function (t) { throw new Error(t); });
+      if (!r.ok) return r.text().then(function (t) {
+        if (!_retried && isExpired(t)) {
+          return refresh().then(function () { return api(p, o, true); },
+            function () { toLogin(); throw new Error('פג תוקף החיבור'); });
+        }
+        throw new Error(t);
+      });
       return r.status === 204 ? null : r.json();
     });
   }
@@ -36,8 +84,7 @@
       body: JSON.stringify({ email: ph + '@gmach.local', password: $('lPw').value })
     }).then(function (r) { return r.json(); }).then(function (d) {
       if (!d.access_token) throw new Error();
-      TOK = d.access_token;
-      try { sessionStorage.setItem('gm_tok', TOK); } catch (x) {}
+      saveToks(d);
       show();
     }).catch(function () {
       $('lMsg').textContent = 'טלפון או סיסמה שגויים.';
@@ -612,7 +659,7 @@
   /* ---------- wiring ---------- */
   $('lForm').addEventListener('submit', login);
   $('out').addEventListener('click', function () {
-    TOK = null; try { sessionStorage.removeItem('gm_tok'); } catch (e) {}
+    clearToks();
     location.reload();
   });
   $('tabs').addEventListener('click', function (e) {
