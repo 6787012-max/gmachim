@@ -212,6 +212,35 @@
     return Math.round((new Date(a) - new Date(b)) / 86400000);
   }
 
+  /* מצב חיפוש/פילטר/מיון עבור טאב ההשאלות */
+  var LOAN_UI = { q: '', filter: 'all', sortBy: 'due', sortDir: 'asc' };
+
+  function matchLoanGroup(g, q) {
+    if (!q) return true;
+    q = q.toLowerCase();
+    if ((g.borrower_name || '').toLowerCase().indexOf(q) >= 0) return true;
+    if ((g.borrower_phone || '').indexOf(q) >= 0) return true;
+    for (var i = 0; i < g.rows.length; i++) {
+      if ((g.rows[i].item_name || '').toLowerCase().indexOf(q) >= 0) return true;
+      if ((g.rows[i].gmach_name || '').toLowerCase().indexOf(q) >= 0) return true;
+    }
+    return false;
+  }
+  function sortGroups(list, by, dir) {
+    var mult = dir === 'desc' ? -1 : 1;
+    var key = function (g) {
+      if (by === 'borrower') return (g.borrower_name || '').toLowerCase();
+      if (by === 'dateOut')  return g.date_out || '';
+      if (by === 'due')      return g.due_date || '9999-12-31';
+      if (by === 'returned') return g.returned_at || '9999-12-31';
+      return '';
+    };
+    return list.slice().sort(function (a, b) {
+      var ka = key(a), kb = key(b);
+      return ka < kb ? -1 * mult : ka > kb ? 1 * mult : 0;
+    });
+  }
+
   function paneLoans() {
     var groups = DATA.loanGroups;
     var open = groups.filter(function (g) { return !g.returned_at; });
@@ -224,7 +253,27 @@
     });
     var closed = groups.filter(function (g) { return g.returned_at; }).slice(0, 30);
 
-    var addBtn = '<button class="btn pri" id="loanNew" style="margin-bottom:14px">+ השאלה חדשה</button>';
+    // סינון לפי צ'יפ הפילטר
+    var openList;
+    if (LOAN_UI.filter === 'overdue')     openList = overdue;
+    else if (LOAN_UI.filter === 'soon')   openList = soon;
+    else if (LOAN_UI.filter === 'closed') openList = closed;
+    else                                  openList = open;
+    // סינון לפי חיפוש
+    if (LOAN_UI.q) openList = openList.filter(function (g) { return matchLoanGroup(g, LOAN_UI.q); });
+    // מיון
+    openList = sortGroups(openList, LOAN_UI.sortBy, LOAN_UI.sortDir);
+
+    var addBtn = '<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px;align-items:center">' +
+      '<button class="btn pri" id="loanNew">+ השאלה חדשה</button>' +
+      '<input id="loanSearch" type="search" placeholder="חיפוש: שם / פריט / טלפון" ' +
+      'value="' + esc(LOAN_UI.q) + '" style="min-width:220px;flex:1;max-width:320px">' +
+      '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
+        chip('all',     'כל הפתוחות', LOAN_UI.filter) +
+        chip('overdue', 'באיחור בלבד', LOAN_UI.filter) +
+        chip('soon',    'להחזרה השבוע', LOAN_UI.filter) +
+        chip('closed',  'הוחזרו לאחרונה', LOAN_UI.filter) +
+      '</div></div>';
     var summary = '<div class="stat">' +
       box(open.length, 'פתוחות') +
       box(overdue.length, 'באיחור') +
@@ -258,25 +307,63 @@
       '</tr>';
     };
 
-    var openHTML = open.length
-      ? '<div class="wrap"><table class="tbl"><thead><tr>' +
-        '<th>פריטים</th><th>שואל</th><th>יציאה</th><th>החזרה מתוכננת</th>' +
-        '<th>הוחזר בפועל</th><th>עלות</th><th></th></tr></thead><tbody>' +
-        open.map(makeRow).join('') + '</tbody></table></div>'
-      : '<div class="empty"><b>אין השאלות פתוחות</b>הכל בבית.</div>';
+    var sortArrow = function (by) {
+      if (LOAN_UI.sortBy !== by) return '';
+      return LOAN_UI.sortDir === 'asc' ? ' ▲' : ' ▼';
+    };
+    var th = function (by, label) {
+      return '<th class="js-sort" data-by="' + by + '" style="cursor:pointer;user-select:none">' +
+        label + sortArrow(by) + '</th>';
+    };
+    var titleTxt = LOAN_UI.filter === 'closed'
+      ? 'הוחזרו לאחרונה' :
+      LOAN_UI.filter === 'overdue' ? 'באיחור' :
+      LOAN_UI.filter === 'soon'    ? 'להחזרה השבוע' : 'השאלות פתוחות';
 
-    var closedHTML = closed.length
-      ? '<h3 style="margin:24px 0 8px">30 השאלות אחרונות שהוחזרו</h3>' +
-        '<div class="wrap"><table class="tbl"><thead><tr>' +
-        '<th>פריטים</th><th>שואל</th><th>יציאה</th><th>החזרה מתוכננת</th>' +
-        '<th>הוחזר בפועל</th><th>עלות</th><th></th></tr></thead><tbody>' +
-        closed.map(makeRow).join('') + '</tbody></table></div>'
-      : '';
+    var listHTML = openList.length
+      ? '<div class="wrap"><table class="tbl"><thead><tr>' +
+        '<th>פריטים</th>' + th('borrower', 'שואל') +
+        th('dateOut', 'יציאה') + th('due', 'החזרה מתוכננת') +
+        th('returned', 'הוחזר בפועל') + '<th>עלות</th><th></th>' +
+        '</tr></thead><tbody>' +
+        openList.map(makeRow).join('') + '</tbody></table></div>'
+      : '<div class="empty"><b>אין תוצאות</b>נסה לשנות פילטר או חיפוש.</div>';
 
     $('pane').innerHTML = addBtn + summary +
-      '<h3 style="margin:16px 0 8px">השאלות פתוחות</h3>' + openHTML + closedHTML;
+      '<h3 style="margin:16px 0 8px">' + titleTxt + ' (' + openList.length + ')</h3>' + listHTML;
 
     $('loanNew').onclick = function () { openLoanForm(null); };
+    var searchEl = $('loanSearch');
+    if (searchEl) {
+      searchEl.oninput = function () { LOAN_UI.q = searchEl.value; paneLoans(); };
+      // אל תאבד את הפוקוס בזמן הקלדה
+      setTimeout(function () {
+        var s = $('loanSearch');
+        if (s && LOAN_UI.q) { s.focus(); s.setSelectionRange(s.value.length, s.value.length); }
+      }, 0);
+    }
+    [].forEach.call(document.querySelectorAll('.js-chip'), function (c) {
+      c.onclick = function () {
+        LOAN_UI.filter = c.dataset.f;
+        paneLoans();
+      };
+    });
+    [].forEach.call(document.querySelectorAll('.js-sort'), function (h) {
+      h.onclick = function () {
+        var by = h.dataset.by;
+        if (LOAN_UI.sortBy === by) LOAN_UI.sortDir = LOAN_UI.sortDir === 'asc' ? 'desc' : 'asc';
+        else { LOAN_UI.sortBy = by; LOAN_UI.sortDir = 'asc'; }
+        paneLoans();
+      };
+    });
+  }
+
+  function chip(id, label, current) {
+    var on = current === id;
+    return '<button class="js-chip" data-f="' + id + '" style="padding:6px 12px;' +
+      'border-radius:20px;border:1px solid ' + (on ? '#1E3A8A' : '#ddd') + ';' +
+      'background:' + (on ? '#1E3A8A' : '#fff') + ';color:' + (on ? '#fff' : '#333') +
+      ';cursor:pointer;font-size:13px">' + label + '</button>';
   }
 
   /* ---------- טופס השאלה (רב-פריטי + כרטיס משאיל) ---------- */
