@@ -104,14 +104,17 @@
       api('gmach_categories?select=*&order=sort'),
       api('gmach_searches?select=q,results,created_at&order=created_at.desc&limit=200'),
       api('gmach_items_stock?select=*&order=name'),
-      api('gmach_loans_view?select=*&order=is_overdue.desc,due_date.asc,date_out.desc')
+      api('gmach_loans_view?select=*&order=is_overdue.desc,due_date.asc,date_out.desc'),
+      api('residents?select=*&order=last_name,first_name')
     ]).then(function (r) {
       DATA.sugg = r[0]; DATA.gm = r[1]; DATA.cats = r[2]; DATA.se = r[3];
-      DATA.items = r[4] || []; DATA.loans = r[5] || [];
+      DATA.items = r[4] || []; DATA.loans = r[5] || []; DATA.residents = r[6] || [];
+      DATA.loanGroups = groupLoans(DATA.loans);
       var open = DATA.sugg.filter(function (s) { return s.status === 'new'; });
-      var openLoans = DATA.loans.filter(function (l) { return !l.returned_at; });
+      var openGroups = DATA.loanGroups.filter(function (g) { return !g.returned_at; });
       $('bSugg').textContent = open.length;
-      var bl = $('bLoans'); if (bl) bl.textContent = openLoans.length;
+      var bl = $('bLoans'); if (bl) bl.textContent = openGroups.length;
+      var bb = $('bBorr'); if (bb) bb.textContent = DATA.residents.length;
       stats(); draw();
     }).catch(function (e) {
       $('pane').innerHTML = '<div class="empty"><b>שגיאת טעינה</b>' + esc(e.message) + '</div>';
@@ -138,8 +141,65 @@
     if (T === 'list') return paneList();
     if (T === 'loans') return paneLoans();
     if (T === 'items') return paneItems();
+    if (T === 'borrowers') return paneBorrowers();
     if (T === 'search') return paneSearch();
     if (T === 'export') return paneExport();
+  }
+
+  /* קיבוץ שורות ההשאלות: כל loan_group_id = השאלה אחת עם N פריטים */
+  function groupLoans(rows) {
+    var by = {};
+    (rows || []).forEach(function (l) {
+      var g = l.loan_group_id || ('_solo_' + l.id);
+      if (!by[g]) {
+        by[g] = {
+          group_id: g,
+          borrower_name: l.borrower_name || '',
+          borrower_phone: l.borrower_phone || '',
+          resident_id: l.resident_id,
+          resident_full_name: l.resident_full_name,
+          date_out: l.date_out,
+          due_date: l.due_date,
+          returned_at: l.returned_at,
+          paid: l.paid,
+          amount: 0,
+          notes: l.notes || '',
+          rows: [],
+          is_overdue: false
+        };
+      }
+      var grp = by[g];
+      grp.rows.push(l);
+      if (l.date_out && (!grp.date_out || l.date_out < grp.date_out)) grp.date_out = l.date_out;
+      if (l.due_date && (!grp.due_date || l.due_date < grp.due_date)) grp.due_date = l.due_date;
+      if (l.is_overdue) grp.is_overdue = true;
+      grp.amount = (grp.amount || 0) + (Number(l.amount) || 0);
+      if (l.returned_at && !grp.returned_at) grp.returned_at = l.returned_at;
+      if (!l.returned_at) grp.returned_at = null; // אם שורה אחת עדיין פתוחה — הקבוצה פתוחה
+    });
+    return Object.keys(by).map(function (k) { return by[k]; }).sort(function (a, b) {
+      if (a.is_overdue !== b.is_overdue) return a.is_overdue ? -1 : 1;
+      if (!!a.returned_at !== !!b.returned_at) return a.returned_at ? 1 : -1;
+      var da = a.due_date || a.date_out || '';
+      var db = b.due_date || b.date_out || '';
+      return db < da ? 1 : -1;
+    });
+  }
+
+  function itemsSummary(rows) {
+    return rows.map(function (l) {
+      return esc((l.item_name || '—') + (l.qty > 1 ? ' × ' + l.qty : ''));
+    }).join('<br>');
+  }
+
+  function loansOfBorrower(residentId, name, phone) {
+    var norm = function (s) { return String(s || '').replace(/\D/g, ''); };
+    return DATA.loanGroups.filter(function (g) {
+      if (residentId && g.resident_id === residentId) return true;
+      if (!residentId && name && g.borrower_name === name &&
+          (!phone || norm(g.borrower_phone) === norm(phone))) return true;
+      return false;
+    });
   }
 
   /* ---------- השאלות ---------- */
@@ -153,14 +213,16 @@
   }
 
   function paneLoans() {
-    var open = DATA.loans.filter(function (l) { return !l.returned_at; });
-    var overdue = open.filter(function (l) { return l.is_overdue; });
-    var soon = open.filter(function (l) {
-      if (l.is_overdue || !l.due_date) return false;
-      var d = daysDiff(l.due_date, new Date().toISOString().slice(0, 10));
+    var groups = DATA.loanGroups;
+    var open = groups.filter(function (g) { return !g.returned_at; });
+    var overdue = open.filter(function (g) { return g.is_overdue; });
+    var today = new Date().toISOString().slice(0, 10);
+    var soon = open.filter(function (g) {
+      if (g.is_overdue || !g.due_date) return false;
+      var d = daysDiff(g.due_date, today);
       return d !== null && d >= 0 && d <= 2;
     });
-    var closed = DATA.loans.filter(function (l) { return l.returned_at; }).slice(0, 30);
+    var closed = groups.filter(function (g) { return g.returned_at; }).slice(0, 30);
 
     var addBtn = '<button class="btn pri" id="loanNew" style="margin-bottom:14px">+ השאלה חדשה</button>';
     var summary = '<div class="stat">' +
@@ -169,44 +231,45 @@
       box(soon.length, 'להחזרה השבוע') +
       '</div>';
 
-    var makeRow = function (l) {
-      var dueTxt = l.due_date ? fmtDate(l.due_date) : '—';
+    var makeRow = function (g) {
+      var dueTxt = g.due_date ? fmtDate(g.due_date) : '—';
       var color = '';
-      if (!l.returned_at && l.is_overdue) color = 'background:#FFE5E5';
-      else if (!l.returned_at && soon.indexOf(l) >= 0) color = 'background:#FFF6E8';
+      if (!g.returned_at && g.is_overdue) color = 'background:#FFE5E5';
+      else if (!g.returned_at && soon.indexOf(g) >= 0) color = 'background:#FFF6E8';
+      var borrowerCell =
+        '<a href="#" class="js-borrower-card" data-name="' + esc(g.borrower_name) +
+        '" data-phone="' + esc(g.borrower_phone || '') +
+        '" data-rid="' + (g.resident_id || '') +
+        '" style="color:#1E3A8A;text-decoration:underline">' + esc(g.borrower_name || '—') + '</a>' +
+        (g.borrower_phone ? '<div style="font-size:12px;color:var(--muted)">' + esc(g.borrower_phone) + '</div>' : '');
       return '<tr style="' + color + '">' +
-        '<td>' + esc(l.item_name || '—') +
-          (l.gmach_name ? '<div style="font-size:12px;color:var(--muted)">' + esc(l.gmach_name) + '</div>' : '') +
-        '</td>' +
-        '<td>' + l.qty + '</td>' +
-        '<td>' + esc(l.borrower_name || '') +
-          (l.borrower_phone ? '<div style="font-size:12px;color:var(--muted)">' + esc(l.borrower_phone) + '</div>' : '') +
-        '</td>' +
-        '<td>' + fmtDate(l.date_out) + '</td>' +
+        '<td>' + itemsSummary(g.rows) + '</td>' +
+        '<td>' + borrowerCell + '</td>' +
+        '<td>' + fmtDate(g.date_out) + '</td>' +
         '<td>' + dueTxt + '</td>' +
-        '<td>' + (l.returned_at ? fmtDate(l.returned_at) : '<b style="color:#B4400A">פתוח</b>') + '</td>' +
-        '<td>' + (l.paid ? '✔' : (l.amount ? '<span style="color:#B4400A">₪' + l.amount + '</span>' : '—')) + '</td>' +
+        '<td>' + (g.returned_at ? fmtDate(g.returned_at) : '<b style="color:#B4400A">פתוח</b>') + '</td>' +
+        '<td>' + (g.amount ? (g.paid ? '✔ ₪' + g.amount : '<span style="color:#B4400A">₪' + g.amount + '</span>') : '—') + '</td>' +
         '<td>' +
-          (l.returned_at
-            ? '<button class="btn sm js-loan-reopen" data-id="' + l.id + '">בטל החזרה</button>'
-            : '<button class="btn sm pri js-loan-return" data-id="' + l.id + '">סמן כמוחזר</button> ' +
-              '<button class="btn sm js-loan-edit" data-id="' + l.id + '">ערוך</button>') +
+          (g.returned_at
+            ? '<button class="btn sm js-loan-reopen" data-gid="' + g.group_id + '">בטל החזרה</button>'
+            : '<button class="btn sm pri js-loan-return" data-gid="' + g.group_id + '">סמן כמוחזר</button> ' +
+              '<button class="btn sm js-loan-edit" data-gid="' + g.group_id + '">ערוך</button>') +
         '</td>' +
       '</tr>';
     };
 
     var openHTML = open.length
       ? '<div class="wrap"><table class="tbl"><thead><tr>' +
-        '<th>פריט</th><th>כמות</th><th>שואל</th><th>יציאה</th><th>החזרה מתוכננת</th>' +
-        '<th>הוחזר בפועל</th><th>שולם</th><th></th></tr></thead><tbody>' +
+        '<th>פריטים</th><th>שואל</th><th>יציאה</th><th>החזרה מתוכננת</th>' +
+        '<th>הוחזר בפועל</th><th>עלות</th><th></th></tr></thead><tbody>' +
         open.map(makeRow).join('') + '</tbody></table></div>'
       : '<div class="empty"><b>אין השאלות פתוחות</b>הכל בבית.</div>';
 
     var closedHTML = closed.length
       ? '<h3 style="margin:24px 0 8px">30 השאלות אחרונות שהוחזרו</h3>' +
         '<div class="wrap"><table class="tbl"><thead><tr>' +
-        '<th>פריט</th><th>כמות</th><th>שואל</th><th>יציאה</th><th>החזרה מתוכננת</th>' +
-        '<th>הוחזר בפועל</th><th>שולם</th><th></th></tr></thead><tbody>' +
+        '<th>פריטים</th><th>שואל</th><th>יציאה</th><th>החזרה מתוכננת</th>' +
+        '<th>הוחזר בפועל</th><th>עלות</th><th></th></tr></thead><tbody>' +
         closed.map(makeRow).join('') + '</tbody></table></div>'
       : '';
 
@@ -216,116 +279,480 @@
     $('loanNew').onclick = function () { openLoanForm(null); };
   }
 
-  function openLoanForm(existingId) {
-    var l = existingId
-      ? DATA.loans.filter(function (x) { return x.id === +existingId; })[0]
-      : null;
-    if (existingId && !l) return;
+  /* ---------- טופס השאלה (רב-פריטי + כרטיס משאיל) ---------- */
+  var LOAN_EDIT_STATE = null; // {group_id, rows: [{id?, item_id, qty}], borrower_name, borrower_phone, resident_id, date_out, due_date, amount, paid, notes}
 
-    if (!DATA.items.length) {
-      alert('אין עדיין פריטים במלאי — קודם צריך להוסיף פריט בטאב "מלאי".');
-      return;
-    }
-    var itemOpts = DATA.items.map(function (it) {
+  function itemOptions(selectedId) {
+    return '<option value="">— בחר פריט —</option>' + DATA.items.map(function (it) {
       var g = DATA.gm.filter(function (x) { return x.id === it.gmach_id; })[0];
       var lbl = it.name + (g ? ' · ' + g.name : '') +
                 ' (זמין ' + it.avail_qty + '/' + it.total_qty + ')';
       return '<option value="' + it.id + '"' +
-        (l && l.item_id === it.id ? ' selected' : '') + '>' + esc(lbl) + '</option>';
+        (selectedId && selectedId === it.id ? ' selected' : '') + '>' + esc(lbl) + '</option>';
     }).join('');
+  }
+
+  function renderItemRows() {
+    var box = $('loanItems'); if (!box) return;
+    box.innerHTML = LOAN_EDIT_STATE.rows.map(function (row, i) {
+      return '<div class="loan-item-row" data-i="' + i + '" ' +
+        'style="display:flex;gap:6px;margin-bottom:6px;align-items:center">' +
+        '<select data-k="item_id" style="flex:1">' + itemOptions(row.item_id) + '</select>' +
+        '<input data-k="qty" type="number" min="1" value="' + (row.qty || 1) +
+          '" style="width:72px" title="כמות">' +
+        (LOAN_EDIT_STATE.rows.length > 1
+          ? '<button class="btn sm js-item-row-del" data-i="' + i +
+            '" style="color:#B4400A">✕</button>'
+          : '<span style="width:32px"></span>') +
+      '</div>';
+    }).join('');
+  }
+
+  function readItemRowsFromDOM() {
+    [].forEach.call(document.querySelectorAll('#loanItems .loan-item-row'), function (el) {
+      var i = +el.dataset.i;
+      var it = el.querySelector('[data-k="item_id"]');
+      var qt = el.querySelector('[data-k="qty"]');
+      LOAN_EDIT_STATE.rows[i].item_id = it.value ? +it.value : null;
+      LOAN_EDIT_STATE.rows[i].qty = Math.max(1, Number(qt.value) || 1);
+    });
+  }
+
+  function residentMatches(q) {
+    q = String(q || '').trim();
+    if (!q) return [];
+    var digits = q.replace(/\D/g, '');
+    var qLow = q.toLowerCase();
+    return DATA.residents.filter(function (r) {
+      var full = (r.full_name || (r.last_name + ' ' + r.first_name)).toLowerCase();
+      if (full.indexOf(qLow) >= 0) return true;
+      if (digits.length >= 3) {
+        if ((r.phone_husband || '').replace(/\D/g, '').indexOf(digits) >= 0) return true;
+        if ((r.phone_wife || '').replace(/\D/g, '').indexOf(digits) >= 0) return true;
+      }
+      return false;
+    }).slice(0, 8);
+  }
+
+  function renderResidentSuggest() {
+    var box = $('resSuggest'); if (!box) return;
+    var q = $('borrName').value;
+    var res = residentMatches(q);
+    if (!res.length) { box.innerHTML = ''; box.style.display = 'none'; return; }
+    box.style.display = 'block';
+    box.innerHTML = res.map(function (r) {
+      var subtitle = [r.phone_husband, r.phone_wife].filter(Boolean).join(' · ');
+      return '<div class="js-res-pick" data-rid="' + r.id +
+        '" data-name="' + esc(r.full_name) +
+        '" data-p1="' + esc(r.phone_husband || '') +
+        '" data-p2="' + esc(r.phone_wife || '') +
+        '" style="padding:6px 8px;cursor:pointer;border-bottom:1px solid #eee">' +
+        '<b>' + esc(r.full_name) + '</b>' +
+        (subtitle ? '<div style="font-size:12px;color:#666">' + esc(subtitle) + '</div>' : '') +
+      '</div>';
+    }).join('');
+  }
+
+  function openLoanForm(existingGroupId) {
+    if (!DATA.items.length) {
+      alert('אין עדיין פריטים במלאי — קודם צריך להוסיף פריט בטאב "מלאי".');
+      return;
+    }
+    var grp = existingGroupId
+      ? DATA.loanGroups.filter(function (x) { return x.group_id === existingGroupId; })[0]
+      : null;
+    if (existingGroupId && !grp) return;
 
     var today = new Date().toISOString().slice(0, 10);
     var dueDefault = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
 
+    LOAN_EDIT_STATE = grp
+      ? {
+          group_id: grp.group_id,
+          rows: grp.rows.map(function (r) { return { id: r.id, item_id: r.item_id, qty: r.qty }; }),
+          borrower_name: grp.borrower_name,
+          borrower_phone: grp.borrower_phone,
+          resident_id: grp.resident_id,
+          date_out: grp.date_out,
+          due_date: grp.due_date,
+          amount: grp.amount,
+          paid: !!grp.paid,
+          notes: grp.notes
+        }
+      : {
+          group_id: null,
+          rows: [{ item_id: null, qty: 1 }],
+          borrower_name: '',
+          borrower_phone: '',
+          resident_id: null,
+          date_out: today,
+          due_date: dueDefault,
+          amount: '',
+          paid: false,
+          notes: ''
+        };
+    var S = LOAN_EDIT_STATE;
+
     var html = '<div id="loanOv" class="ov on" style="position:fixed;inset:0;' +
       'background:rgba(0,0,0,.5);z-index:1000;display:flex;align-items:center;' +
       'justify-content:center;padding:14px;overflow:auto">' +
-      '<div style="background:#fff;border-radius:14px;max-width:520px;width:100%;' +
+      '<div style="background:#fff;border-radius:14px;max-width:560px;width:100%;' +
       'padding:22px;max-height:92vh;overflow:auto">' +
-      '<h3 style="margin:0 0 12px">' + (l ? 'עריכת השאלה' : 'השאלה חדשה') + '</h3>' +
-      '<div class="f"><label>פריט</label><select data-k="item_id">' + itemOpts + '</select></div>' +
-      '<div class="f"><label>כמות</label>' +
-        '<input data-k="qty" type="number" min="1" value="' + (l ? l.qty : 1) + '"></div>' +
+      '<h3 style="margin:0 0 12px">' + (grp ? 'עריכת השאלה' : 'השאלה חדשה') + '</h3>' +
       '<div class="f"><label>שם השואל</label>' +
-        '<input data-k="borrower_name" type="text" value="' + esc(l ? l.borrower_name : '') + '"></div>' +
+        '<div style="position:relative">' +
+        '<input id="borrName" type="text" autocomplete="off" value="' + esc(S.borrower_name) + '" placeholder="הקלד שם / טלפון">' +
+        '<div id="resSuggest" style="position:absolute;top:100%;left:0;right:0;background:#fff;' +
+        'border:1px solid #ddd;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.1);' +
+        'z-index:10;max-height:220px;overflow:auto;display:none"></div>' +
+        '</div>' +
+        (S.resident_id
+          ? '<div style="font-size:12px;color:#0A7B36;margin-top:4px" id="resTag">✓ מקושר לתושב מהמאגר</div>'
+          : '<div style="font-size:12px;color:#999;margin-top:4px" id="resTag"></div>') +
+      '</div>' +
       '<div class="f"><label>טלפון</label>' +
-        '<input data-k="borrower_phone" type="tel" value="' + esc(l ? l.borrower_phone : '') + '"></div>' +
-      '<div class="f"><label>תאריך יציאה</label>' +
-        '<input data-k="date_out" type="date" value="' + (l ? l.date_out : today) + '"></div>' +
-      '<div class="f"><label>תאריך החזרה מתוכנן</label>' +
-        '<input data-k="due_date" type="date" value="' + (l && l.due_date ? l.due_date : dueDefault) + '"></div>' +
-      '<div class="f"><label>עלות (אופציונלי)</label>' +
-        '<input data-k="amount" type="number" step="0.5" value="' + (l && l.amount != null ? l.amount : '') + '"></div>' +
+        '<input id="borrPhone" type="tel" value="' + esc(S.borrower_phone) + '"></div>' +
+      '<div class="f"><label>פריטים בהשאלה</label>' +
+        '<div id="loanItems"></div>' +
+        '<button class="btn sm ghost" id="itemAddRow" style="margin-top:4px">+ פריט נוסף</button>' +
+      '</div>' +
+      '<div class="f" style="display:flex;gap:10px">' +
+        '<div style="flex:1"><label>תאריך יציאה</label>' +
+          '<input id="dateOut" type="date" value="' + (S.date_out || today) + '"></div>' +
+        '<div style="flex:1"><label>תאריך החזרה מתוכנן</label>' +
+          '<input id="dateDue" type="date" value="' + (S.due_date || dueDefault) + '"></div>' +
+      '</div>' +
+      '<div class="f"><label>עלות (אופציונלי, סה"כ להשאלה)</label>' +
+        '<input id="amt" type="number" step="0.5" value="' + (S.amount || '') + '"></div>' +
       '<div class="f"><label style="display:flex;align-items:center;gap:8px">' +
-        '<input data-k="paid" type="checkbox"' + (l && l.paid ? ' checked' : '') + '> שולם</label></div>' +
+        '<input id="paid" type="checkbox"' + (S.paid ? ' checked' : '') + '> שולם</label></div>' +
       '<div class="f"><label>הערות</label>' +
-        '<textarea data-k="notes" rows="2">' + esc(l ? l.notes : '') + '</textarea></div>' +
+        '<textarea id="notes" rows="2">' + esc(S.notes) + '</textarea></div>' +
       '<div class="acts" style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">' +
-      '<button class="btn pri" id="loanSave">' + (l ? 'עדכן' : 'שמור השאלה') + '</button>' +
-      (l ? '<button class="btn ghost" id="loanDel" style="color:#B4400A;border-color:#B4400A">מחק</button>' : '') +
+      '<button class="btn pri" id="loanSave">' + (grp ? 'עדכן' : 'שמור השאלה') + '</button>' +
+      (grp ? '<button class="btn ghost" id="loanDel" style="color:#B4400A;border-color:#B4400A">מחק השאלה</button>' : '') +
       '<button class="btn ghost" id="loanCancel">ביטול</button>' +
       '</div><div class="msg" id="loanMsg"></div></div></div>';
 
     var wrap = document.createElement('div');
     wrap.innerHTML = html;
     document.body.appendChild(wrap.firstChild);
-    var close = function () { var o = $('loanOv'); if (o) o.parentNode.removeChild(o); };
+    renderItemRows();
+
+    var close = function () { var o = $('loanOv'); if (o) o.parentNode.removeChild(o); LOAN_EDIT_STATE = null; };
     $('loanCancel').onclick = close;
+
+    $('itemAddRow').onclick = function () {
+      readItemRowsFromDOM();
+      LOAN_EDIT_STATE.rows.push({ item_id: null, qty: 1 });
+      renderItemRows();
+    };
+    $('loanItems').addEventListener('click', function (e) {
+      var d = e.target.closest && e.target.closest('.js-item-row-del');
+      if (!d) return;
+      readItemRowsFromDOM();
+      LOAN_EDIT_STATE.rows.splice(+d.dataset.i, 1);
+      renderItemRows();
+    });
+
+    $('borrName').addEventListener('input', function () {
+      LOAN_EDIT_STATE.resident_id = null;
+      var tag = $('resTag'); if (tag) { tag.textContent = ''; tag.style.color = '#999'; }
+      renderResidentSuggest();
+    });
+    $('borrName').addEventListener('blur', function () {
+      setTimeout(function () { var b = $('resSuggest'); if (b) b.style.display = 'none'; }, 200);
+    });
+    $('borrName').addEventListener('focus', renderResidentSuggest);
+    $('resSuggest').addEventListener('mousedown', function (e) {
+      var it = e.target.closest && e.target.closest('.js-res-pick');
+      if (!it) return;
+      e.preventDefault();
+      $('borrName').value = it.dataset.name;
+      var phoneEl = $('borrPhone');
+      if (!phoneEl.value.trim()) {
+        phoneEl.value = it.dataset.p1 || it.dataset.p2 || '';
+      }
+      LOAN_EDIT_STATE.resident_id = +it.dataset.rid;
+      var tag = $('resTag');
+      if (tag) { tag.textContent = '✓ מקושר לתושב מהמאגר'; tag.style.color = '#0A7B36'; }
+      $('resSuggest').style.display = 'none';
+    });
+
     if ($('loanDel')) $('loanDel').onclick = function () {
-      if (!confirm('למחוק את ההשאלה?')) return;
-      api('gmach_loans?id=eq.' + l.id, { method: 'DELETE' })
+      if (!confirm('למחוק את ההשאלה כולה?')) return;
+      api('gmach_loans?loan_group_id=eq.' + grp.group_id, { method: 'DELETE' })
         .then(function () { close(); load(); })
         .catch(function (e) {
           $('loanMsg').textContent = 'שגיאה: ' + e.message;
           $('loanMsg').className = 'msg err';
         });
     };
+
     $('loanSave').onclick = function () {
-      var body = {};
-      [].forEach.call(document.querySelectorAll('#loanOv [data-k]'), function (el) {
-        var k = el.dataset.k;
-        if (el.type === 'checkbox') body[k] = el.checked;
-        else if (el.type === 'number') body[k] = el.value === '' ? null : Number(el.value);
-        else if (el.type === 'date') body[k] = el.value || null;
-        else body[k] = el.value.trim();
-      });
-      if (!body.borrower_name) {
+      readItemRowsFromDOM();
+      var name = $('borrName').value.trim();
+      var phone = $('borrPhone').value.trim();
+      var dOut = $('dateOut').value || today;
+      var dDue = $('dateDue').value || null;
+      var amt  = $('amt').value === '' ? null : Number($('amt').value);
+      var paid = $('paid').checked;
+      var notes = $('notes').value.trim();
+
+      if (!name) {
         $('loanMsg').textContent = 'חסר שם שואל';
         $('loanMsg').className = 'msg err'; return;
       }
-      if (!body.qty || body.qty < 1) body.qty = 1;
-      $('loanSave').disabled = true;
-      var call = l
-        ? api('gmach_loans?id=eq.' + l.id, { method: 'PATCH', body: JSON.stringify(body) })
-        : api('gmach_loans', { method: 'POST', body: JSON.stringify(body) });
-      call.then(function (r) {
-        if (!r || (Array.isArray(r) && !r.length)) throw new Error('לא נשמרה שורה');
-        close(); load();
-      }).catch(function (e) {
-        $('loanMsg').textContent = 'שגיאה: ' + e.message;
-        $('loanMsg').className = 'msg err';
-        $('loanSave').disabled = false;
+      var rows = LOAN_EDIT_STATE.rows.filter(function (r) { return r.item_id; });
+      if (!rows.length) {
+        $('loanMsg').textContent = 'חסרים פריטים בהשאלה';
+        $('loanMsg').className = 'msg err'; return;
+      }
+      // בדיקת זמינות (מלאי שלא כולל את השורות של הקבוצה הנוכחית אם עורכים)
+      var editingRowIds = grp ? grp.rows.map(function (r) { return r.id; }) : [];
+      var overflow = null;
+      var totals = {};
+      rows.forEach(function (r) {
+        totals[r.item_id] = (totals[r.item_id] || 0) + r.qty;
       });
+      Object.keys(totals).forEach(function (iid) {
+        var it = DATA.items.filter(function (x) { return x.id === +iid; })[0];
+        if (!it) return;
+        var alreadyOutFromThisGroup = 0;
+        if (grp) {
+          grp.rows.forEach(function (rr) {
+            if (rr.item_id === +iid && !rr.returned_at) alreadyOutFromThisGroup += rr.qty;
+          });
+        }
+        var effectiveAvail = it.avail_qty + alreadyOutFromThisGroup;
+        if (totals[iid] > effectiveAvail) {
+          overflow = it.name + ' — מבוקש ' + totals[iid] + ', זמין ' + effectiveAvail;
+        }
+      });
+      if (overflow) {
+        $('loanMsg').textContent = 'אין מספיק במלאי: ' + overflow;
+        $('loanMsg').className = 'msg err'; return;
+      }
+
+      $('loanSave').disabled = true;
+
+      var shared = {
+        borrower_name: name,
+        borrower_phone: phone,
+        resident_id: LOAN_EDIT_STATE.resident_id,
+        date_out: dOut,
+        due_date: dDue,
+        paid: paid,
+        notes: notes
+      };
+      // עלות: שומרים על השורה הראשונה בלבד; שאר השורות = null (למנוע ספירה כפולה)
+      var perRow = function (i) {
+        var r = Object.assign({}, shared);
+        r.amount = i === 0 ? amt : null;
+        return r;
+      };
+
+      var chain;
+      if (!grp) {
+        // חדשה: יוצרים group_id בצד השרת (default gen_random_uuid), אבל נעדיף לחלוק אחד ידני
+        // ניצור UUID אקראי בצד הלקוח כדי לוודא שכל השורות משתפות group_id.
+        var uuid = (crypto && crypto.randomUUID) ? crypto.randomUUID() :
+          'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+            var r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+          });
+        var body = rows.map(function (row, i) {
+          return Object.assign({
+            item_id: row.item_id, qty: row.qty, loan_group_id: uuid
+          }, perRow(i));
+        });
+        chain = api('gmach_loans', { method: 'POST', body: JSON.stringify(body) });
+      } else {
+        // עריכה: לזהות שורות למחיקה, לעדכון, ליצירה
+        var origIds = grp.rows.map(function (r) { return r.id; });
+        var keptIds = rows.filter(function (r) { return r.id; }).map(function (r) { return r.id; });
+        var toDel = origIds.filter(function (id) { return keptIds.indexOf(id) < 0; });
+
+        var promises = [];
+        // עדכון פרטים משותפים לכל השורות של הקבוצה
+        promises.push(api('gmach_loans?loan_group_id=eq.' + grp.group_id, {
+          method: 'PATCH', body: JSON.stringify(shared)
+        }));
+        // עלות: PATCH רק על השורה הראשונה שנשמרת (או ליצור חדשה אם אין)
+        // מחיקות
+        toDel.forEach(function (id) {
+          promises.push(api('gmach_loans?id=eq.' + id, { method: 'DELETE' }));
+        });
+        // עדכון qty לפריטים ששרדו
+        rows.forEach(function (r, i) {
+          if (r.id) {
+            var patch = { item_id: r.item_id, qty: r.qty };
+            if (i === 0) patch.amount = amt;
+            promises.push(api('gmach_loans?id=eq.' + r.id, {
+              method: 'PATCH', body: JSON.stringify(patch)
+            }));
+          } else {
+            var newRow = Object.assign({
+              item_id: r.item_id, qty: r.qty, loan_group_id: grp.group_id
+            }, perRow(i));
+            promises.push(api('gmach_loans', { method: 'POST', body: JSON.stringify(newRow) }));
+          }
+        });
+        chain = Promise.all(promises);
+      }
+
+      chain.then(function () { close(); load(); })
+        .catch(function (e) {
+          $('loanMsg').textContent = 'שגיאה: ' + e.message;
+          $('loanMsg').className = 'msg err';
+          $('loanSave').disabled = false;
+        });
     };
   }
 
-  function returnLoan(id) {
+  function returnLoanGroup(groupId) {
     var today = new Date().toISOString().slice(0, 10);
-    api('gmach_loans?id=eq.' + id, {
+    api('gmach_loans?loan_group_id=eq.' + groupId, {
       method: 'PATCH',
       body: JSON.stringify({ returned_at: today, paid: true })
     }).then(function (r) {
-      if (!r || !r.length) throw new Error('לא עודכנה שורה');
+      if (!r || !r.length) throw new Error('לא עודכנו שורות');
       load();
     }).catch(function (e) { alert('שגיאה: ' + e.message); });
   }
-  function reopenLoan(id) {
-    api('gmach_loans?id=eq.' + id, {
+  function reopenLoanGroup(groupId) {
+    api('gmach_loans?loan_group_id=eq.' + groupId, {
       method: 'PATCH', body: JSON.stringify({ returned_at: null })
     }).then(function (r) {
-      if (!r || !r.length) throw new Error('לא עודכנה שורה');
+      if (!r || !r.length) throw new Error('לא עודכנו שורות');
       load();
     }).catch(function (e) { alert('שגיאה: ' + e.message); });
+  }
+
+  /* ---------- טאב משאילים ---------- */
+  function paneBorrowers() {
+    var q = ($('borrSearch') && $('borrSearch').value || '').trim();
+    var filter = q.length >= 1 ? residentMatches(q) : DATA.residents;
+
+    // סטטיסטיקה לכל תושב
+    var byId = {};
+    DATA.loanGroups.forEach(function (g) {
+      if (!g.resident_id) return;
+      var s = byId[g.resident_id] || (byId[g.resident_id] = { total: 0, open: 0, overdue: 0 });
+      s.total += 1;
+      if (!g.returned_at) s.open += 1;
+      if (g.is_overdue) s.overdue += 1;
+    });
+
+    var rows = filter.map(function (r) {
+      var s = byId[r.id] || { total: 0, open: 0, overdue: 0 };
+      var phones = [r.phone_husband, r.phone_wife].filter(Boolean).join(' · ');
+      var openHtml = s.open
+        ? '<b style="color:' + (s.overdue ? '#B4400A' : '#0A7B36') + '">' + s.open +
+          (s.overdue ? ' (' + s.overdue + ' באיחור)' : '') + '</b>'
+        : '—';
+      return '<tr class="js-borrower-card" data-rid="' + r.id + '" style="cursor:pointer">' +
+        '<td><b>' + esc(r.full_name || (r.last_name + ' ' + r.first_name)) + '</b></td>' +
+        '<td>' + esc(phones) + '</td>' +
+        '<td>' + openHtml + '</td>' +
+        '<td>' + s.total + '</td>' +
+      '</tr>';
+    }).join('');
+
+    var searchBox = '<input id="borrSearch" type="search" placeholder="חיפוש: שם או טלפון" ' +
+      'value="' + esc(q) + '" style="margin-bottom:10px;width:280px;max-width:100%">';
+
+    var table = filter.length
+      ? '<div class="wrap"><table class="tbl"><thead><tr>' +
+        '<th>שם</th><th>טלפון</th><th>השאלות פתוחות</th><th>סה"כ השאלות</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table></div>'
+      : '<div class="empty"><b>לא נמצאו תושבים בחיפוש הזה</b></div>';
+
+    $('pane').innerHTML = searchBox + table;
+    $('borrSearch').oninput = function () { paneBorrowers(); };
+    $('borrSearch').focus();
+  }
+
+  function openBorrowerCard(opts) {
+    // opts: {rid?, name?, phone?}
+    var r = opts.rid ? DATA.residents.filter(function (x) { return x.id === +opts.rid; })[0] : null;
+    var displayName = r ? (r.full_name || (r.last_name + ' ' + r.first_name)) : (opts.name || '—');
+    var phones = r
+      ? [r.phone_husband, r.phone_wife].filter(Boolean).join(' · ')
+      : (opts.phone || '');
+
+    var groups = loansOfBorrower(r ? r.id : null, opts.name || displayName, opts.phone);
+    var open = groups.filter(function (g) { return !g.returned_at; });
+    var closed = groups.filter(function (g) { return g.returned_at; });
+
+    var loanRow = function (g) {
+      var color = '';
+      if (!g.returned_at && g.is_overdue) color = 'background:#FFE5E5';
+      return '<tr style="' + color + '">' +
+        '<td>' + itemsSummary(g.rows) + '</td>' +
+        '<td>' + fmtDate(g.date_out) + '</td>' +
+        '<td>' + (g.due_date ? fmtDate(g.due_date) : '—') + '</td>' +
+        '<td>' + (g.returned_at ? fmtDate(g.returned_at) : '<b style="color:#B4400A">פתוח</b>') + '</td>' +
+        '<td>' + (g.amount ? '₪' + g.amount + (g.paid ? ' ✔' : '') : '—') + '</td>' +
+        '<td>' + (!g.returned_at
+          ? '<button class="btn sm js-loan-edit" data-gid="' + g.group_id + '">ערוך</button>'
+          : '<button class="btn sm js-loan-reopen" data-gid="' + g.group_id + '">בטל החזרה</button>') +
+        '</td></tr>';
+    };
+    var tbl = function (list, title) {
+      if (!list.length) return '';
+      return '<h4 style="margin:14px 0 6px">' + title + '</h4>' +
+        '<div class="wrap"><table class="tbl"><thead><tr>' +
+        '<th>פריטים</th><th>יציאה</th><th>החזרה מתוכננת</th><th>הוחזר</th><th>עלות</th><th></th>' +
+        '</tr></thead><tbody>' + list.map(loanRow).join('') + '</tbody></table></div>';
+    };
+
+    var html = '<div id="borrOv" class="ov on" style="position:fixed;inset:0;' +
+      'background:rgba(0,0,0,.5);z-index:1000;display:flex;align-items:center;' +
+      'justify-content:center;padding:14px;overflow:auto">' +
+      '<div style="background:#fff;border-radius:14px;max-width:820px;width:100%;' +
+      'padding:22px;max-height:92vh;overflow:auto">' +
+      '<div style="display:flex;justify-content:space-between;align-items:start;gap:10px">' +
+        '<div>' +
+          '<h3 style="margin:0">' + esc(displayName) + '</h3>' +
+          (phones ? '<div style="color:#666">' + esc(phones) + '</div>' : '') +
+        '</div>' +
+        '<button class="btn ghost" id="borrCancel">סגור</button>' +
+      '</div>' +
+      '<div class="stat" style="margin-top:12px">' +
+        box(open.length, 'פתוחות') +
+        box(open.filter(function (g) { return g.is_overdue; }).length, 'באיחור') +
+        box(closed.length, 'הוחזרו') +
+      '</div>' +
+      (groups.length
+        ? tbl(open, 'השאלות פתוחות') + tbl(closed, 'היסטוריה')
+        : '<div class="empty" style="margin-top:12px"><b>אין השאלות רשומות למשאיל הזה</b></div>') +
+      '<div style="margin-top:16px">' +
+        '<button class="btn pri" id="borrNewLoan">+ השאלה חדשה למשאיל הזה</button>' +
+      '</div>' +
+      '</div></div>';
+
+    var wrap = document.createElement('div');
+    wrap.innerHTML = html;
+    document.body.appendChild(wrap.firstChild);
+    var close = function () { var o = $('borrOv'); if (o) o.parentNode.removeChild(o); };
+    $('borrCancel').onclick = close;
+    $('borrNewLoan').onclick = function () {
+      close();
+      openLoanForm(null);
+      // מילוי מיידי של פרטי המשאיל בטופס החדש
+      setTimeout(function () {
+        if (!LOAN_EDIT_STATE) return;
+        var n = $('borrName'), p = $('borrPhone');
+        if (n) n.value = displayName;
+        if (p && !p.value) p.value = r ? (r.phone_husband || r.phone_wife || '') : (opts.phone || '');
+        if (r) {
+          LOAN_EDIT_STATE.resident_id = r.id;
+          var tag = $('resTag');
+          if (tag) { tag.textContent = '✓ מקושר לתושב מהמאגר'; tag.style.color = '#0A7B36'; }
+        }
+      }, 0);
+    };
   }
 
   /* ---------- מלאי ---------- */
@@ -671,15 +1098,25 @@
     var edit = e.target.closest && e.target.closest('.js-edit');
     if (edit) { openEdit(edit.dataset.id); return; }
     var loanE = e.target.closest && e.target.closest('.js-loan-edit');
-    if (loanE) { openLoanForm(loanE.dataset.id); return; }
+    if (loanE) { openLoanForm(loanE.dataset.gid); return; }
     var itE = e.target.closest && e.target.closest('.js-item-edit');
     if (itE) { openItemForm(itE.dataset.id); return; }
+    var bc = e.target.closest && e.target.closest('.js-borrower-card');
+    if (bc) {
+      e.preventDefault();
+      openBorrowerCard({
+        rid: bc.dataset.rid && bc.dataset.rid !== '' ? +bc.dataset.rid : null,
+        name: bc.dataset.name || '',
+        phone: bc.dataset.phone || ''
+      });
+      return;
+    }
     var t = e.target;
     if (t.classList.contains('js-ok')) return approve(t.dataset.id);
     if (t.classList.contains('js-done')) return mark(t.dataset.id, 'done', 'טופל ידנית').then(load);
     if (t.classList.contains('js-rej')) return mark(t.dataset.id, 'rejected', '').then(load);
-    if (t.classList.contains('js-loan-return')) return returnLoan(t.dataset.id);
-    if (t.classList.contains('js-loan-reopen')) return reopenLoan(t.dataset.id);
+    if (t.classList.contains('js-loan-return')) return returnLoanGroup(t.dataset.gid);
+    if (t.classList.contains('js-loan-reopen')) return reopenLoanGroup(t.dataset.gid);
     if (t.classList.contains('js-item-del')) return delItem(t.dataset.id);
     if (t.classList.contains('js-hide')) {
       return api('gmachim?id=eq.' + t.dataset.id, {
